@@ -1,0 +1,26 @@
+# name: test/sql/decide_json.test
+# description: a JSON object state reads like a STRUCT, other JSON values as their text or compact JSON
+# group: [sql]
+
+require decision_tune
+
+require json
+
+require-env DECISION_TUNE_MODEL_PATH
+
+statement ok
+SET decision_tune_model_path = '{DECISION_TUNE_MODEL_PATH}';
+
+query I
+SELECT count(DISTINCT p) FROM (
+    SELECT decision_yes_no('{"subject": "Hi", "n": 3, "tags": ["a", "b"], "ok": true}'::JSON, 'Is this a greeting?') AS p
+    UNION ALL SELECT decision_yes_no('subject: Hi | n: 3 | tags: ["a","b"] | ok: true', 'Is this a greeting?'));
+----
+1
+
+query I
+SELECT count(DISTINCT p) FROM (
+    SELECT decision_yes_no('"Hello there"'::JSON, 'Is this a greeting?') AS p
+    UNION ALL SELECT decision_yes_no('Hello there', 'Is this a greeting?'));
+----
+1

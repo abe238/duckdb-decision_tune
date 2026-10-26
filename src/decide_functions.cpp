@@ -1,0 +1,256 @@
+#include "decision_tune/decide_functions.hpp"
+
+#include "decision_tune/model_store.hpp"
+#include "decision_tune/state_text.hpp"
+
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parallel/task_executor.hpp"
+#include "duckdb/planner/expression.hpp"
+
+namespace duckdb {
+namespace decision_tune {
+
+//! One question about one state.
+struct Decision {
+	string state;
+	string question;
+	vector<string> options;
+};
+
+//===--------------------------------------------------------------------===//
+// Scoring
+//===--------------------------------------------------------------------===//
+//! Encodes and scores one decision as a DuckDB task.
+class DecisionTask : public BaseExecutorTask {
+public:
+	DecisionTask(TaskExecutor &executor, ClientContext &context, DecisionModel &model, const Decision &decision,
+	             std::vector<double> &out)
+	    : BaseExecutorTask(executor), context(context), model(model), decision(decision), out(out) {
+	}
+
+	void ExecuteTask() override {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		auto prompt = EncodePrompt(model.Tokenizer(), decision.state, decision.question, decision.options);
+		out = model.Probabilities(prompt);
+	}
+
+	string TaskType() const override {
+		return "DecisionTuneTask";
+	}
+
+private:
+	ClientContext &context;
+	DecisionModel &model;
+	const Decision &decision;
+	std::vector<double> &out;
+};
+
+static string DecisionKey(const Decision &decision) {
+	string key = decision.state;
+	key += '\0';
+	key += decision.question;
+	for (auto &option : decision.options) {
+		key += '\0';
+		key += option;
+	}
+	return key;
+}
+
+//! The option probabilities of every decision. A chunk's distinct decisions run as tasks on DuckDB's scheduler: a
+//! forward pass takes tens of milliseconds, and a small table is often read by a single thread.
+static vector<std::vector<double>> ScoreDecisions(ClientContext &context, const vector<Decision> &decisions) {
+	vector<std::vector<double>> result(decisions.size());
+	if (decisions.empty()) {
+		return result;
+	}
+	auto model = ModelStore::Instance().GetModel(context);
+
+	vector<idx_t> unique_index(decisions.size());
+	vector<idx_t> unique_decisions;
+	unordered_map<string, idx_t> seen;
+	for (idx_t i = 0; i < decisions.size(); i++) {
+		auto entry = seen.emplace(DecisionKey(decisions[i]), unique_decisions.size());
+		if (entry.second) {
+			unique_decisions.push_back(i);
+		}
+		unique_index[i] = entry.first->second;
+	}
+
+	vector<std::vector<double>> unique_results(unique_decisions.size());
+	TaskExecutor executor(context);
+	for (idx_t u = 0; u < unique_decisions.size(); u++) {
+		executor.ScheduleTask(
+		    make_uniq<DecisionTask>(executor, context, *model, decisions[unique_decisions[u]], unique_results[u]));
+	}
+	executor.WorkOnTasks();
+	for (idx_t i = 0; i < decisions.size(); i++) {
+		result[i] = unique_results[unique_index[i]];
+	}
+	return result;
+}
+
+//! The rows to compute: one if every argument is constant (the result is then constant too), else all of them.
+static idx_t PrepareResult(DataChunk &args, Vector &result) {
+	if (args.AllConstant()) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+		return 1;
+	}
+	return args.size();
+}
+
+//===--------------------------------------------------------------------===//
+// decision_choose(state, question, options)
+//===--------------------------------------------------------------------===//
+static LogicalType ChooseResultType() {
+	child_list_t<LogicalType> fields;
+	fields.emplace_back(Identifier("choice"), LogicalType::VARCHAR);
+	fields.emplace_back(Identifier("confidence"), LogicalType::DOUBLE);
+	fields.emplace_back(Identifier("probabilities"), LogicalType::MAP(LogicalType::VARCHAR, LogicalType::DOUBLE));
+	return LogicalType::STRUCT(std::move(fields));
+}
+
+static void ChooseResolveTypes(ResolveScalarFunctionTypesInput &input) {
+	auto &bound_function = input.GetBoundFunction();
+	auto &options_type = input.GetArguments()[2]->GetReturnType();
+	auto &arguments = bound_function.GetArguments();
+	switch (options_type.id()) {
+	case LogicalTypeId::UNKNOWN:
+		throw ParameterNotResolvedException();
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY:
+		arguments[2] = LogicalType::LIST(LogicalType::VARCHAR);
+		break;
+	case LogicalTypeId::MAP:
+		arguments[2] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+		break;
+	case LogicalTypeId::STRUCT: {
+		child_list_t<LogicalType> fields;
+		for (auto &child : StructType::GetChildTypes(options_type)) {
+			fields.emplace_back(child.first, LogicalType::VARCHAR);
+		}
+		arguments[2] = LogicalType::STRUCT(std::move(fields));
+		break;
+	}
+	default:
+		throw BinderException("decision_choose: options must be a list of texts (['billing', 'shipping']), a MAP of "
+		                      "key to description (MAP {'billing': 'Billing: charges, refunds'}) or a STRUCT "
+		                      "({billing: 'Billing: charges, refunds'}), not %s",
+		                      options_type.ToString());
+	}
+}
+
+static void ChooseFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto count = PrepareResult(args, result);
+	vector<Decision> decisions;
+	vector<vector<DecisionOption>> options;
+	vector<idx_t> rows;
+	for (idx_t row = 0; row < count; row++) {
+		auto state_value = args.data[0].GetValue(row);
+		auto question = args.data[1].GetValue(row);
+		auto options_value = args.data[2].GetValue(row);
+		if (state_value.IsNull() || question.IsNull() || options_value.IsNull()) {
+			result.SetValue(row, Value(result.GetType()));
+			continue;
+		}
+		Decision decision {StateText(state_value), question.ToString(), {}};
+		options.push_back(DecisionOptions(options_value));
+		for (auto &option : options.back()) {
+			decision.options.push_back(option.text);
+		}
+		decisions.push_back(std::move(decision));
+		rows.push_back(row);
+	}
+	auto probabilities = ScoreDecisions(state.GetContext(), decisions);
+	for (idx_t i = 0; i < decisions.size(); i++) {
+		auto &p = probabilities[i];
+		idx_t best = 0;
+		vector<Value> keys, values;
+		for (idx_t k = 0; k < p.size(); k++) {
+			// The first option wins a tie, like max() over a dict.
+			if (p[k] > p[best]) {
+				best = k;
+			}
+			keys.emplace_back(options[i][k].key);
+			values.push_back(Value::DOUBLE(p[k]));
+		}
+		result.SetValue(rows[i], Value::STRUCT(result.GetType(), {Value(options[i][best].key), Value::DOUBLE(p[best]),
+		                                                          Value::MAP(LogicalType::VARCHAR, LogicalType::DOUBLE,
+		                                                                     std::move(keys), std::move(values))}));
+	}
+}
+
+//===--------------------------------------------------------------------===//
+// decision_yes_no(state, question)
+//===--------------------------------------------------------------------===//
+static void YesNoFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto count = PrepareResult(args, result);
+	vector<Decision> decisions;
+	vector<idx_t> rows;
+	for (idx_t row = 0; row < count; row++) {
+		auto state_value = args.data[0].GetValue(row);
+		auto question = args.data[1].GetValue(row);
+		if (state_value.IsNull() || question.IsNull()) {
+			result.SetValue(row, Value(LogicalType::DOUBLE));
+			continue;
+		}
+		decisions.push_back(Decision {StateText(state_value), question.ToString(), {"yes", "no"}});
+		rows.push_back(row);
+	}
+	auto probabilities = ScoreDecisions(state.GetContext(), decisions);
+	for (idx_t i = 0; i < decisions.size(); i++) {
+		result.SetValue(rows[i], Value::DOUBLE(probabilities[i][0]));
+	}
+}
+
+//===--------------------------------------------------------------------===//
+// decision_tune_tokenize(text)
+//===--------------------------------------------------------------------===//
+static void TokenizeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto count = PrepareResult(args, result);
+	shared_ptr<BpeTokenizer> tokenizer;
+	for (idx_t row = 0; row < count; row++) {
+		auto text = args.data[0].GetValue(row);
+		if (text.IsNull()) {
+			result.SetValue(row, Value(result.GetType()));
+			continue;
+		}
+		if (!tokenizer) {
+			tokenizer = ModelStore::Instance().GetTokenizer(state.GetContext());
+		}
+		vector<Value> ids;
+		for (auto id : EncodeText(*tokenizer, StringValue::Get(text))) {
+			ids.push_back(Value::INTEGER(static_cast<int32_t>(id)));
+		}
+		result.SetValue(row, Value::LIST(LogicalType::INTEGER, std::move(ids)));
+	}
+}
+
+void RegisterDecideFunctions(ExtensionLoader &loader) {
+	ScalarFunction choose("decision_choose", {}, ChooseResultType(), ChooseFunction);
+	choose.GetSignature()
+	    .AddParameter("state", LogicalType::ANY)
+	    .AddParameter("question", LogicalType::VARCHAR)
+	    .AddParameter("options", LogicalType::ANY);
+	choose.SetResolveTypesCallback(ChooseResolveTypes);
+	choose.SetFallible();
+	loader.RegisterFunction(choose);
+
+	ScalarFunction yes_no("decision_yes_no", {}, LogicalType::DOUBLE, YesNoFunction);
+	yes_no.GetSignature().AddParameter("state", LogicalType::ANY).AddParameter("question", LogicalType::VARCHAR);
+	yes_no.SetFallible();
+	loader.RegisterFunction(yes_no);
+
+	ScalarFunction tokenize("decision_tune_tokenize", {}, LogicalType::LIST(LogicalType::INTEGER), TokenizeFunction);
+	tokenize.GetSignature().AddParameter("text", LogicalType::VARCHAR);
+	loader.RegisterFunction(tokenize);
+}
+
+} // namespace decision_tune
+} // namespace duckdb

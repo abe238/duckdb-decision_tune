@@ -1,0 +1,133 @@
+# name: test/sql/decision_tune.test
+# description: the extension loads, links ONNX Runtime and checks its inputs before touching the model
+# group: [sql]
+
+require decision_tune
+
+query II
+SELECT decision_tune_version().onnxruntime LIKE '1.%', decision_tune_version().model;
+----
+true	DecisionTune 1.0
+
+query IIII
+SELECT file_name, file_bytes, url LIKE 'https://huggingface.co/decision-tune/decisiontune-1.0/resolve/%', local_path LIKE '%' || file_name
+FROM decision_tune_models() ORDER BY file_name;
+----
+model.onnx	1579877218	true	true
+tokenizer.json	3583228	true	true
+
+query I
+SELECT typeof(decision_choose('x', 'q', ['a', 'b']));
+----
+STRUCT(choice VARCHAR, confidence DOUBLE, probabilities MAP(VARCHAR, DOUBLE))
+
+# NULL inputs give NULL without loading the model
+query III
+SELECT decision_choose(NULL, 'q', ['a', 'b']), decision_choose('x', NULL, ['a', 'b']), decision_yes_no('x', NULL::VARCHAR);
+----
+NULL	NULL	NULL
+
+statement error
+SELECT decision_choose('x', 'q', 42);
+----
+options must be a list of texts
+
+statement error
+SELECT decision_choose('x', 'q', ['only one']);
+----
+a decision needs at least 2 options, got 1
+
+statement error
+SELECT decision_choose('x', 'q', ['a', 'b', 'a']);
+----
+option 'a' is given more than once
+
+statement error
+SELECT decision_choose('x', 'q', ['a', NULL]);
+----
+options must not contain NULL
+
+statement error
+SELECT decision_choose('x', 'q', MAP {'': 'empty'});
+----
+a decision needs at least 2 options
+
+statement ok
+SET decision_tune_model_path = '/definitely/not/a/directory';
+
+statement error
+SELECT decision_yes_no('x', 'q');
+----
+is not a directory
+
+statement ok
+RESET decision_tune_model_path;
+
+# The DECIDE clause is checked when it is parsed
+statement ok
+CREATE TABLE tickets (subject VARCHAR, message VARCHAR);
+
+statement error
+FROM tickets DECIDE (CHOOSE 'Which team?' AMONG (billing, shipping) AS team);
+----
+DECIDE requires GIVEN
+
+statement error
+FROM tickets DECIDE (CHOOSE 'Which team?' AMONG (billing) AS team GIVEN message);
+----
+AMONG needs at least 2 options
+
+statement error
+FROM tickets DECIDE (CHOOSE 'Which team?' AMONG (billing, billing) AS team GIVEN message);
+----
+option 'billing' is given more than once
+
+statement error
+FROM tickets DECIDE (ASK 'Is this a refund?' GIVEN message);
+----
+name the answer of every question with AS, e.g. ASK 'Is this a refund?' AS answer
+
+statement error
+FROM tickets DECIDE (CHOOSE 'q' AMONG (a, b) AS team, ASK 'q' AS team GIVEN message);
+----
+would add a second column named 'team'
+
+statement error
+FROM tickets DECIDE (ASK 'q' AS team, ASK 'q' AS needs_review GIVEN message);
+----
+would add a second column named 'needs_review'
+
+statement error
+FROM tickets DECIDE (ASK 'q' AS team GIVEN message, message);
+----
+GIVEN reads 'message' more than once
+
+statement error
+FROM tickets DECIDE (ASK 'q' AS team GIVEN message GIVEN subject);
+----
+GIVEN is given more than once
+
+# Binding the clause does not load the model
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM tickets DECIDE (
+    CHOOSE 'Which team should handle this customer message?' AMONG (
+        billing 'Billing: charges, refunds, invoices',
+        shipping 'Shipping: delivery, lost or damaged packages',
+        tech 'Tech support: bugs, crashes, login problems') AS team,
+    ASK 'Is the customer asking for a refund or an exchange?' AS refund
+    GIVEN subject, message));
+----
+subject	VARCHAR
+message	VARCHAR
+team	VARCHAR
+team_confidence	DOUBLE
+refund	BOOLEAN
+refund_confidence	DOUBLE
+refund_p_yes	DOUBLE
+needs_review	BOOLEAN
+
+# `decide`, `choose` and `ask` stay ordinary names
+query III
+SELECT decide, choose, ask FROM (SELECT 1 AS decide, 2 AS choose, 3 AS ask) decide;
+----
+1	2	3

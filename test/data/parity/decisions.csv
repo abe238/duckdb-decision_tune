@@ -1,0 +1,12 @@
+case_id,state,question,options,probabilities,prompt_tokens
+0,The order arrived broken.,Which team should handle this customer message?,"Billing: charges, refunds, invoices␞Shipping: delivery, lost or damaged packages␞Tech support: bugs, crashes, login problems","[0.07933734469093233, 0.7119618658342266, 0.208700789474841]",48
+1,The order arrived broken. I want my money back.,Is the customer asking for a refund?,yes␞no,"[0.9960206548266202, 0.003979345173379727]",27
+2,What is the weather tomorrow in Paris?,Which tool should be called?,Get the weather forecast for a city and date␞Send an email to a person␞Create a meeting or event in the calendar␞No tool: answer the user directly,"[0.93745335234855, 0.014099145076782737, 0.008608739963087527, 0.03983876261157972]",52
+3,subject: Broken mug | message: The order arrived broken. I want my money back.,Is the customer asking for a refund or an exchange?,yes␞no,"[0.995686297272864, 0.00431370272713606]",38
+4,subject: Broken mug | message: The order arrived broken. I want my money back.,What is the tone of the customer?,Negative: the customer is unhappy or upset␞Neutral: a plain request or question␞Positive: the customer is happy or thankful,"[0.9826801520643196, 0.01391344996122998, 0.0034063979744505635]",58
+5,I was charged twice this month.,Which team handles this?,billing␞shipping␞tech support,"[0.5930144490428025, 0.1570541767581543, 0.24993137419904315]",25
+6,"Thanks a lot, everything works great now!",Does this message ask to delete the account?,yes␞no,"[0.005552361672859556, 0.9944476383271403]",26
+7,,Is the state empty?,yes␞no,"[0.5484508455793596, 0.4515491544206404]",13
+8,"Le colis est arrivé cassé, je veux être remboursé.",Which team should handle this customer message?,"Billing: charges, refunds, invoices␞Shipping: delivery, lost or damaged packages␞Tech support: bugs, crashes, login problems␞None of these: spam, praise, or a message for no team","[0.10304132043167036, 0.1856795647138947, 0.054580535672423776, 0.6566985791820111]",76
+9,My app crashes [MASK] on login since the update <|endoftext|>,Which team?,billing␞tech,"[0.5402548968042833, 0.45974510319571665]",23
+10,a  b   c    d,Which letter comes first?,a␞b␞c␞d,"[0.6340275804285935, 0.14205403956429158, 0.12774092991773123, 0.09617745008938364]",24

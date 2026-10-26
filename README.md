@@ -1,0 +1,271 @@
+# decision_tune: decisions in DuckDB
+
+`decision_tune` runs [DecisionTune 1.0](https://decisiontune.com/) inside DuckDB. DecisionTune is a 395M decision
+model ([model card](https://huggingface.co/decision-tune/decisiontune-1.0),
+[code](https://github.com/decision-tune/decision-tune)). You give it a state, a question and options. It picks one
+option and gives a probability for each, or it gives P(yes) for a yes/no question. It does one encoder pass and
+never generates text.
+
+With this extension, routing, tagging and triage are SQL queries. They need no Python, no API key and no GPU. The
+network runs on CPU through a statically linked [ONNX Runtime](https://onnxruntime.ai/).
+
+```sql
+LOAD decision_tune;
+
+FROM tickets DECIDE (
+    CHOOSE 'Which team should handle this customer message?' AMONG (
+        billing  'Billing: charges, refunds, invoices',
+        shipping 'Shipping: delivery, lost or damaged packages',
+        tech     'Tech support: bugs, crashes, login problems') AS team,
+    ASK 'Is the customer asking for a refund or an exchange?' AS refund
+    GIVEN subject, message
+);
+```
+
+| subject       | message                                                            | team     | team_confidence | refund | refund_confidence | refund_p_yes | needs_review |
+|---------------|--------------------------------------------------------------------|----------|----------------:|--------|------------------:|-------------:|--------------|
+| Broken mug    | The order arrived broken. I want my money back.                    | shipping | 0.78            | true   | 1.00              | 1.00         | false        |
+| Double charge | I was charged twice this month.                                    | billing  | 0.73            | true   | 0.87              | 0.87         | false        |
+| Login loop    | The app crashes every time I try to log in since the last update. | tech     | 0.99            | false  | 0.98              | 0.02         | false        |
+
+(The confidences are rounded here. Output from the build in this repository, Apple M4 Pro.)
+
+## Install
+
+`decision_tune` is meant for DuckDB 2.0. Build it from source (see [Building](#building)), then load
+`build/release/extension/decision_tune/decision_tune.duckdb_extension`. The draft for the community extensions
+repository is in `description.yml`. Once that is published:
+
+```sql
+INSTALL decision_tune FROM community;
+LOAD decision_tune;
+```
+
+`LOAD` adds the `DECIDE` syntax to every connection. A connection that was already open switches when its current
+query ends, and this includes the connection that runs `LOAD`. So send `LOAD decision_tune` and the first `DECIDE`
+query as two separate statements, not as one string.
+
+The first query that runs the model downloads DecisionTune 1.0 from Hugging Face. That is `tokenizer.json` (3.6 MB)
+and `onnx/model.onnx` (1.58 GB), pinned to one repository commit. The extension checks each file against the
+SHA-256 in the release's `manifest.json` and caches it in `~/.duckdb/decision_tune/1.0/`. The model loads when a
+query first needs an answer, not when the query is bound, so `DESCRIBE` of a `DECIDE` query stays fast. The
+optimizer may compute a call whose arguments are all constants while it plans the query.
+
+## Deciding
+
+### `FROM … DECIDE (…)`
+
+`DECIDE` follows a relation in `FROM`, as `PIVOT` does. It asks one or more questions about every row. It returns
+the row's columns, then the answers:
+
+```
+FROM relation [alias]
+DECIDE (
+    CHOOSE question AMONG (key ['description'], ...) AS name
+  | ASK question AS name
+  [, ...]
+    GIVEN expr [AS name] [, ...]
+    [ REVIEW BELOW threshold ]
+) [alias]
+```
+
+| Part | Meaning |
+|---|---|
+| `CHOOSE question AMONG (…) AS name` | Pick one of at least 2 options. A key is an identifier or a string. The description is what the model reads. Without a description, the model reads the key with `_` replaced by spaces. |
+| `ASK question AS name` | A yes/no question. |
+| `AS name` | Names the answer columns. Required. |
+| `GIVEN` | What the model reads: the *state*. With one expression, the state is its text. With several, it is `name: value \| name: value`, the same as a decision-tune recipe that reads several columns. Required. |
+| `REVIEW BELOW` | The confidence below which `needs_review` is set. The default is 0.6, the recipe default. |
+
+For each question, the clause adds these columns:
+- `CHOOSE`: `name` (the key of the chosen option) and `name_confidence` (its probability).
+- `ASK`: `name` (`p_yes >= 0.5`), `name_confidence` (`greatest(p_yes, 1 - p_yes)`) and `name_p_yes`.
+
+Then it adds `needs_review`. This is true when any confidence is below the threshold, or when an answer is
+`NULL` because its input was `NULL`.
+
+DuckDB rewrites the clause into plain SQL around the functions below. So the clause works in CTEs, subqueries,
+joins, prepared statements (`ASK $1`), views and table macros. A stored view keeps the rewritten SQL.
+
+### `decision_choose(…)` and `decision_yes_no(…)`
+
+The clause is built on these two functions. You can also call them yourself:
+
+```sql
+SELECT message,
+       decision_choose(message, 'Which tool should be called?', {
+           get_weather: 'Get the weather forecast for a city and date',
+           send_email: 'Send an email to a person',
+           none: 'No tool: answer the user directly'}).choice AS tool,
+       decision_yes_no(message, 'Does this message ask to delete the account?') AS p_delete
+FROM messages;
+```
+
+- `decision_choose(state, question, options)` returns
+  `STRUCT(choice VARCHAR, confidence DOUBLE, probabilities MAP(VARCHAR, DOUBLE))`. The probabilities sum to 1.
+  `options` can be any of these:
+  - a list of texts, such as `['billing', 'shipping']`. Each text is its own key.
+  - a `MAP` of key to description, such as `MAP {'billing': 'Billing: charges, refunds'}`.
+  - a `STRUCT` of key to description, such as `{billing: 'Billing: charges, refunds'}`.
+- `decision_yes_no(state, question)` returns P(yes) as a `DOUBLE`.
+
+Both functions also accept the clause's words:
+
+```sql
+SELECT decision_choose('Which team?' AMONG (billing 'Billing: charges', tech 'Tech support: bugs') GIVEN subject, message),
+       decision_yes_no('Is the customer asking for a refund?' GIVEN message)
+FROM tickets;
+```
+
+The state can be any value. It is read the way the reference engine reads it:
+- Text is read as is.
+- A `STRUCT`, a `MAP` or a JSON object is read as `key: value | key: value`. Text values are read as is, `NULL`
+  as empty, and other values as compact JSON.
+- Other values are read as compact JSON (`3`, `true`, `["a","b"]`). Dates, timestamps and UUIDs are read as their
+  text.
+
+A `NULL` state, question or options gives a `NULL` result. A prompt longer than the model's 8,192-token context
+raises an error. The reference refuses such prompts too and does not truncate them. Shorten the input, for example
+with `left(message, 20000)`, or wrap the call in `TRY(…)` to get `NULL` instead.
+
+`decision_tune_tokenize(text)` returns the token ids the model sees for a text. Use it to check lengths.
+
+### Writing good questions
+
+DecisionTune scores the options you give it. The quality of a decision depends on the question, the options and
+the state. Upstream's [prompting guide](https://github.com/decision-tune/decision-tune/blob/main/skills/decisiontune/references/prompting.md)
+gives these tips:
+- **Describe every option.** `shipping 'Shipping: delivery, lost or damaged packages'` gives much better results
+  than `shipping` alone.
+- **Offer a way out**, such as `none 'None of these: spam, praise, or a message for no team'`.
+- **Write down the criteria.** "Is this urgent?" alone gives weak results. Say what urgent means.
+- **Ask one judgment per question.** Combine the answers in SQL.
+- **Put only what a person would read into `GIVEN`.** Leave out ids and timestamps.
+- **Phrase yes/no questions so that yes is the case you act on.** Then use `p_yes` with a threshold.
+
+The model's probabilities are not calibrated. Use `needs_review` (or a threshold of your own) to send unsure rows
+to a person.
+
+## Performance
+
+Every question for every row is one forward pass of the 395M encoder. The extension spreads the decisions of each
+chunk of rows over DuckDB's worker threads, so `SET threads` sets the parallelism. ONNX Runtime itself runs
+single-threaded. Measured on an Apple M4 Pro (10 performance and 4 efficiency cores), with tickets of about 20
+tokens and one yes/no question each:
+
+| Threads | Decisions per second |
+|---|---|
+| 1 | 17 (about 60 ms each) |
+| 4 | 59 |
+| 8 | 57 |
+| 14 | 79 |
+
+Throughput stops growing after a few threads because memory bandwidth limits it, not compute. The published ONNX
+graph scores one prompt per pass, and each pass reads all 1.6 GB of float32 weights. 10,000 rows with two
+questions therefore take about four minutes.
+
+DuckDB only computes the decisions that a query uses. `SELECT count(*) FROM t DECIDE (...)` does not run the
+model, and neither does a column that you do not select.
+
+The extension keeps the probabilities of the last 100,000 distinct prompts in memory. A query that asks the same
+question about the same state twice is scored once, and so is a query that you run again.
+
+## Settings
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `decision_tune_model_url` | `'https://huggingface.co/decision-tune/decisiontune-1.0/resolve/<commit>'` | The URL the files are downloaded from. A local directory also works. |
+| `decision_tune_cache_dir` | `'~/.duckdb/decision_tune/1.0'` | Where the downloaded files are cached. |
+| `decision_tune_model_path` | `''` | A local directory to use instead of the cache. It holds `tokenizer.json` and `model.onnx`, or is a clone of the Hugging Face repository. The files are not checksummed. |
+
+### Offline use
+
+`decision_tune_models()` lists each file with its URL, SHA-256, size, local path and whether it is cached:
+
+```sql
+SELECT file_name, cached, local_path FROM decision_tune_models();
+```
+
+To use the extension on a machine without internet access, do one of these:
+- Copy `tokenizer.json` and `model.onnx` into the cache directory.
+- Set `decision_tune_model_path` to a directory that holds them, such as a `git clone` of the model repository.
+
+## How it works
+
+- **Tokenizer.** DecisionTune uses ModernBERT's byte-level BPE tokenizer. `src/tokenizer.cpp` is a C++ port of
+  the parts of Hugging Face `tokenizers` that this tokenizer uses:
+  - added tokens, with special tokens matched on the raw text and the others after normalization
+  - NFC normalization, through DuckDB's bundled utf8proc
+  - the GPT-2 pre-tokenizer regex
+  - BPE merges
+
+  It reads the published `tokenizer.json`.
+- **Prompt.** `src/decision_model.cpp` builds the sequence the way `engine.py` does:
+  `[CLS] question [SEP] ([MASK] option)+ [SEP] state [SEP]`. It replaces special tokens in the input text with
+  spaces. A softmax over the logits that the published ONNX graph returns for the `[MASK]` positions gives the
+  probabilities. The result has no calibration temperature, no option filtering and no truncation.
+- **Syntax.** `DECIDE` and the `AMONG` / `GIVEN` call forms are additions to DuckDB's PEG grammar. They are
+  registered as the `decision_tune` grammar extension (`src/decide_grammar.cpp`). They only add rules and choices
+  and replace no stock rule, so they combine with other grammar extensions (such as
+  [timestral](https://github.com/altertable-ai/duckdb-timestral)). `SET active_grammar_extensions` turns them off
+  for a connection.
+
+The parity tests in `test/sql/parity_*.test` compare the extension with Hugging Face `tokenizers` and the Python
+ONNX Runtime (`scripts/parity/make_fixtures.py`):
+- Token ids match exactly on 392 cases. The cases cover multilingual text, emoji, combining marks, runs of spaces,
+  contractions and special tokens. A further fuzz run over 20,000 random multilingual strings also matched.
+- Probabilities match to within 1e-4. This includes the README example of the model card: Shipping 71.2%,
+  Tech support 20.9%, Billing 7.9%.
+
+## Limitations
+
+- DecisionTune scores options. It does not reason step by step, and its probabilities are not calibrated. Do not
+  use it for high-risk decisions about people (hiring, credit, housing, health, legal) without independent
+  validation (see the model card).
+- The ONNX graph takes one sequence at a time. Throughput comes from running many rows in parallel, not from
+  batching.
+- The extension is not available for DuckDB-WASM, Windows MinGW or Linux musl builds, because ONNX Runtime does
+  not support them.
+- The model needs about 1.6 GB of memory once it is loaded. It is loaded once per process and shared by every
+  connection.
+
+## Building
+
+```bash
+git clone --recurse-submodules https://github.com/altertable-ai/duckdb-decision-tune
+cd duckdb-decision-tune
+git clone https://github.com/microsoft/vcpkg.git ../vcpkg && ../vcpkg/bootstrap-vcpkg.sh
+export VCPKG_TOOLCHAIN_PATH=$PWD/../vcpkg/scripts/buildsystems/vcpkg.cmake
+GEN=ninja make release
+```
+
+The build uses C++17 for both DuckDB and the extension. The first build compiles ONNX Runtime from source through
+vcpkg, which takes a while. The overlay ports in `vcpkg_ports/` are the same as in duckdb-timestral, and
+[`vcpkg_ports/README.md`](vcpkg_ports/README.md) explains them.
+
+Run the tests:
+
+```bash
+make test
+```
+
+Tests that need the model are skipped unless you point them at a directory that holds `tokenizer.json` and
+`model.onnx`. The extension's own cache directory works:
+
+```bash
+DECISION_TUNE_MODEL_PATH=$HOME/.duckdb/decision_tune/1.0 make test
+```
+
+To regenerate the parity fixtures:
+
+```bash
+cd scripts/parity && uv run make_fixtures.py ~/.duckdb/decision_tune/1.0
+```
+
+## Licences
+
+- This extension: MIT (see `LICENSE`).
+- DecisionTune 1.0 weights, ONNX graph and tokenizer: Apache-2.0, DecisionTune. The model card lists the
+  licences and known issues of the training data.
+- ONNX Runtime: MIT.
+- vcpkg overlay ports, adapted from [anofox_tabfm](https://github.com/DataZooDE/anofox-tabfm): MIT.

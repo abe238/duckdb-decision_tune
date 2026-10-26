@@ -1,0 +1,120 @@
+# name: test/sql/decide_clause.test
+# description: FROM ... DECIDE (...), the call forms, and the state rendering of structs, maps and JSON
+# group: [sql]
+
+require decision_tune
+
+require-env DECISION_TUNE_MODEL_PATH
+
+statement ok
+SET decision_tune_model_path = '{DECISION_TUNE_MODEL_PATH}';
+
+statement ok
+CREATE TABLE tickets AS FROM (VALUES
+    (1, 'Broken mug', 'The order arrived broken. I want my money back.'),
+    (2, 'Double charge', 'I was charged twice this month for my subscription.'),
+    (3, 'Cannot log in', 'The app crashes every time I try to log in since the last update.'),
+    (4, NULL, NULL)
+) t(id, subject, message);
+
+# The clause adds the recipe columns; NULL inputs give NULL answers that need a review
+query IIIII
+SELECT id, team, refund, team_confidence > 0.5, needs_review FROM tickets DECIDE (
+    CHOOSE 'Which team should handle this customer message?' AMONG (
+        billing 'Billing: charges, refunds, invoices',
+        shipping 'Shipping: delivery, lost or damaged packages',
+        tech 'Tech support: bugs, crashes, login problems') AS team,
+    ASK 'Is the customer asking for a refund or an exchange?' AS refund
+    GIVEN message
+    REVIEW BELOW 0.5
+) ORDER BY id;
+----
+1	shipping	true	true	false
+2	billing	false	true	false
+3	tech	false	true	false
+4	NULL	NULL	NULL	true
+
+# The clause is the functions: one input is the state, several are read as "name: value | ..."
+query I
+SELECT bool_and(abs(a.team_confidence - b.d.confidence) < 1e-12 AND a.team = b.d.choice
+                AND abs(a.refund_p_yes - b.p) < 1e-12 AND a.refund_confidence = greatest(b.p, 1 - b.p))
+FROM (FROM tickets DECIDE (
+        CHOOSE 'Which team?' AMONG (billing 'Billing: charges, refunds, invoices', shipping, tech_support) AS team,
+        ASK 'Is the customer asking for a refund?' AS refund
+        GIVEN subject, message)) a
+JOIN (SELECT id,
+             decision_choose('subject: ' || subject || ' | message: ' || message, 'Which team?',
+                             MAP {'billing': 'Billing: charges, refunds, invoices', 'shipping': NULL, 'tech_support': ''}) AS d,
+             decision_yes_no({subject: subject, message: message}, 'Is the customer asking for a refund?') AS p
+      FROM tickets WHERE message IS NOT NULL) b USING (id);
+----
+true
+
+# Keys without a description read as the key with spaces for underscores
+query I
+SELECT decision_choose(message, 'Which team?', ['billing', 'tech support']).probabilities['tech support']
+     = decision_choose(message, 'Which team?', {billing: NULL, tech_support: NULL}).probabilities['tech_support']
+FROM tickets WHERE id = 3;
+----
+true
+
+# The call forms, spelled like the clause
+query I
+SELECT bool_and(
+    decision_choose('Which team?' AMONG (billing 'Billing: charges', tech 'Tech support: bugs') GIVEN subject, message AS body)
+        = decision_choose({subject: subject, body: message}, 'Which team?', MAP {'billing': 'Billing: charges', 'tech': 'Tech support: bugs'})
+    AND decision_yes_no('Is this about money?' GIVEN message) = decision_yes_no(message, 'Is this about money?'))
+FROM tickets WHERE id <= 3;
+----
+true
+
+# A STRUCT and a MAP state read the same: "key: value | ..."; non-text values as compact JSON
+query I
+SELECT count(DISTINCT p) FROM (
+    SELECT decision_yes_no({subject: 'Hi', n: 3, tags: ['a', 'b'], ok: true}, 'Is this a greeting?') AS p
+    UNION ALL SELECT decision_yes_no(MAP {'subject': 'Hi', 'n': '3', 'tags': '["a","b"]', 'ok': 'true'}, 'Is this a greeting?')
+    UNION ALL SELECT decision_yes_no('subject: Hi | n: 3 | tags: ["a","b"] | ok: true', 'Is this a greeting?'));
+----
+1
+
+# Any case, aliases on the source and on the result, joins after the clause
+query II
+SELECT d.id, d.t FROM tickets s decide (choose 'Which team?' among ('billing' 'Billing: charges, refunds', 'tech' 'Tech support: bugs, crashes, login problems') as t given s.message review below 0.9) AS d
+JOIN (SELECT 3 AS id) USING (id);
+----
+3	tech
+
+# Views and prepared statements store the lowered SQL
+statement ok
+CREATE VIEW triage AS FROM tickets DECIDE (ASK 'Is the customer asking for a refund?' AS refund GIVEN message);
+
+query II
+SELECT id, refund FROM triage WHERE id = 1;
+----
+1	true
+
+statement ok
+PREPARE p AS SELECT refund FROM tickets DECIDE (ASK $1 AS refund GIVEN message) WHERE id = 1;
+
+query I
+EXECUTE p('Is the customer asking for a refund?');
+----
+true
+
+# Rows are scored in parallel and repeated decisions are scored once
+query III
+SELECT count(*), count(team), count(DISTINCT (id, team, team_confidence)) FROM range(300) r(i), tickets DECIDE (
+    CHOOSE 'Which team?' AMONG (billing, shipping, tech) AS team GIVEN message) WHERE id <= 3;
+----
+900	900	3
+
+# An over-long prompt is refused, never truncated; TRY turns the error into NULL
+statement error
+SELECT decision_yes_no(repeat('word ', 9000), 'Is this long?');
+----
+more than the 8192-token context of DecisionTune 1.0
+
+query I
+SELECT TRY(decision_yes_no(repeat('word ', 9000), 'Is this long?'));
+----
+NULL

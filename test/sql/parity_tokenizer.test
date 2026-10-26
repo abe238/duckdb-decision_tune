@@ -1,0 +1,24 @@
+# name: test/sql/parity_tokenizer.test
+# description: decision_tune_tokenize matches the Hugging Face tokenizer (test/data/parity/tokenizer.csv)
+# group: [sql]
+
+require decision_tune
+
+require-env DECISION_TUNE_MODEL_PATH
+
+statement ok
+SET decision_tune_model_path = '{DECISION_TUNE_MODEL_PATH}';
+
+statement ok
+CREATE TABLE cases AS
+SELECT case_id::INTEGER AS case_id, coalesce(text, '') AS text, ids
+FROM read_csv('test/data/parity/tokenizer.csv', header = true, all_varchar = true, quote = '"', escape = '"');
+
+query I
+SELECT count(*) FROM cases;
+----
+392
+
+query III
+SELECT case_id, text, ids FROM cases WHERE decision_tune_tokenize(text)::VARCHAR <> ids ORDER BY case_id;
+----

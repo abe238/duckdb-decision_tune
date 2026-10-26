@@ -1,0 +1,65 @@
+#
+# Builds the extension on Linux and checks the tokenizer and decision_choose against the Hugging Face tokenizer and
+# the Python ONNX Runtime (test/data/parity) using the published DecisionTune 1.0 files. The distribution pipeline
+# skips these tests because they need the model files.
+#
+name: Parity
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  parity:
+    name: Parity with tokenizers + onnxruntime (DecisionTune 1.0)
+    runs-on: ubuntu-latest
+    env:
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      VCPKG_TARGET_TRIPLET: x64-linux-release
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg-cache,readwrite
+      GEN: ninja
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Install build tools
+        run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build
+
+      # ONNX Runtime takes a long time to build from source; keep vcpkg's binary packages between runs.
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg_ports/**', 'toolchains/**') }}
+
+      - name: Create the vcpkg cache directory
+        run: mkdir -p vcpkg-cache
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11.1
+        with:
+          vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
+
+      - name: Build
+        run: make release
+
+      - name: Download DecisionTune 1.0
+        run: |
+          mkdir -p models
+          base=https://huggingface.co/decision-tune/decisiontune-1.0/resolve/$(grep -o 'HF_REVISION = "[0-9a-f]*"' src/include/decision_tune/model_manifest.hpp | grep -o '[0-9a-f]\{40\}')
+          curl --fail --retry 3 -L -o models/tokenizer.json "$base/tokenizer.json"
+          curl --fail --retry 3 -L -o models/model.onnx "$base/onnx/model.onnx"
+          for f in tokenizer.json model.onnx; do
+            expected=$(tr -d "\n" < src/include/decision_tune/model_manifest.hpp | grep -o "\"$f\", \"[^\"]*\",[[:space:]]*\"[0-9a-f]*\"" | grep -o '[0-9a-f]\{64\}')
+            echo "${expected}  models/$f" | sha256sum --check
+          done
+
+      - name: Test
+        run: DECISION_TUNE_MODEL_PATH=$PWD/models make test

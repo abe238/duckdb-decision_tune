@@ -1,0 +1,44 @@
+# name: test/sql/model_store_download.test
+# description: downloading through decision_tune_model_url verifies the file and leaves no partial file
+# group: [sql]
+
+require decision_tune
+
+require-env DECISION_TUNE_MODEL_PATH
+
+# A local directory works as the base URL too
+statement ok
+SET GLOBAL decision_tune_model_url = '{DECISION_TUNE_MODEL_PATH}';
+
+statement ok
+SET GLOBAL decision_tune_cache_dir = '{TEST_DIR}/download_cache';
+
+query I
+SELECT cached FROM decision_tune_models() WHERE file_name = 'tokenizer.json';
+----
+false
+
+# Concurrent connections race to download and load the same tokenizer.
+concurrentloop connection 0 8
+
+query I
+SELECT decision_tune_tokenize('The order arrived broken.');
+----
+[510, 1340, 7244, 7154, 15]
+
+endloop
+
+query I
+SELECT cached FROM decision_tune_models() WHERE file_name = 'tokenizer.json';
+----
+true
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/download_cache/*.tmp*');
+----
+0
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/download_cache/tokenizer.json.verified');
+----
+1
