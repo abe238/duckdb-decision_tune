@@ -93,19 +93,14 @@ FROM tickets DECIDE (CHOOSE 'q' AMONG (a, b) AS team, ASK 'q' AS team GIVEN mess
 would add a second column named 'team'
 
 statement error
-FROM tickets DECIDE (ASK 'q' AS team, ASK 'q' AS needs_review GIVEN message);
+FROM tickets DECIDE (ASK 'q' AS team, ASK 'q' AS team_probabilities GIVEN message);
 ----
-would add a second column named 'needs_review'
+would add a second column named 'team_probabilities'
 
 statement error
 FROM tickets DECIDE (ASK 'q' AS team GIVEN message, message);
 ----
 GIVEN reads 'message' more than once
-
-statement error
-FROM tickets DECIDE (ASK 'q' AS team GIVEN message GIVEN subject);
-----
-GIVEN is given more than once
 
 # Binding the clause does not load the model
 query II
@@ -121,10 +116,10 @@ subject	VARCHAR
 message	VARCHAR
 team	VARCHAR
 team_confidence	DOUBLE
+team_probabilities	MAP(VARCHAR, DOUBLE)
 refund	BOOLEAN
 refund_confidence	DOUBLE
-refund_p_yes	DOUBLE
-needs_review	BOOLEAN
+refund_probabilities	MAP(VARCHAR, DOUBLE)
 
 # `decide`, `choose` and `ask` stay ordinary names
 query III

@@ -17,27 +17,41 @@ CREATE TABLE tickets AS FROM (VALUES
     (4, NULL, NULL)
 ) t(id, subject, message);
 
-# The clause adds the recipe columns; NULL inputs give NULL answers that need a review
-query IIIII
-SELECT id, team, refund, team_confidence > 0.5, needs_review FROM tickets DECIDE (
+# The clause adds an answer, a confidence and the probabilities per question; NULL inputs give NULL answers
+query IIIIII
+SELECT id, team, refund, team_confidence > 0.5, map_keys(team_probabilities), map_keys(refund_probabilities)
+FROM tickets DECIDE (
     CHOOSE 'Which team should handle this customer message?' AMONG (
         billing 'Billing: charges, refunds, invoices',
         shipping 'Shipping: delivery, lost or damaged packages',
         tech 'Tech support: bugs, crashes, login problems') AS team,
     ASK 'Is the customer asking for a refund or an exchange?' AS refund
     GIVEN message
-    REVIEW BELOW 0.5
 ) ORDER BY id;
 ----
-1	shipping	true	true	false
-2	billing	false	true	false
-3	tech	false	true	false
-4	NULL	NULL	NULL	true
+1	shipping	true	true	[billing, shipping, tech]	[yes, no]
+2	billing	false	true	[billing, shipping, tech]	[yes, no]
+3	tech	false	true	[billing, shipping, tech]	[yes, no]
+4	NULL	NULL	NULL	NULL	NULL
+
+# The probabilities sum to 1 and the confidence is the largest one; filtering is a plain WHERE
+query II
+SELECT count(*), bool_and(abs(list_sum(map_values(team_probabilities)) - 1) < 1e-9
+                          AND team_confidence = list_max(map_values(team_probabilities))
+                          AND refund_confidence = list_max(map_values(refund_probabilities)))
+FROM tickets DECIDE (
+    CHOOSE 'Which team?' AMONG (billing 'Billing: charges, refunds', tech 'Tech support: bugs, crashes') AS team,
+    ASK 'Is the customer asking for a refund?' AS refund
+    GIVEN message)
+WHERE team_confidence >= 0.5 AND refund_probabilities['yes'] < 0.99;
+----
+2	true
 
 # The clause is the functions: one input is the state, several are read as "name: value | ..."
 query I
 SELECT bool_and(abs(a.team_confidence - b.d.confidence) < 1e-12 AND a.team = b.d.choice
-                AND abs(a.refund_p_yes - b.p) < 1e-12 AND a.refund_confidence = greatest(b.p, 1 - b.p))
+                AND abs(a.refund_probabilities['yes'] - b.p) < 1e-12 AND a.refund_confidence = greatest(b.p, 1 - b.p)
+                AND a.team_probabilities = b.d.probabilities)
 FROM (FROM tickets DECIDE (
         CHOOSE 'Which team?' AMONG (billing 'Billing: charges, refunds, invoices', shipping, tech_support) AS team,
         ASK 'Is the customer asking for a refund?' AS refund
@@ -79,7 +93,7 @@ SELECT count(DISTINCT p) FROM (
 
 # Any case, aliases on the source and on the result, joins after the clause
 query II
-SELECT d.id, d.t FROM tickets s decide (choose 'Which team?' among ('billing' 'Billing: charges, refunds', 'tech' 'Tech support: bugs, crashes, login problems') as t given s.message review below 0.9) AS d
+SELECT d.id, d.t FROM tickets s decide (choose 'Which team?' among ('billing' 'Billing: charges, refunds', 'tech' 'Tech support: bugs, crashes, login problems') as t given s.message) AS d
 JOIN (SELECT 3 AS id) USING (id);
 ----
 3	tech

@@ -22,13 +22,14 @@ FROM tickets DECIDE (
 );
 ```
 
-| subject       | message                                                            | team     | team_confidence | refund | refund_confidence | refund_p_yes | needs_review |
-|---------------|--------------------------------------------------------------------|----------|----------------:|--------|------------------:|-------------:|--------------|
-| Broken mug    | The order arrived broken. I want my money back.                    | shipping | 0.78            | true   | 1.00              | 1.00         | false        |
-| Double charge | I was charged twice this month.                                    | billing  | 0.73            | true   | 0.87              | 0.87         | false        |
-| Login loop    | The app crashes every time I try to log in since the last update. | tech     | 0.99            | false  | 0.98              | 0.02         | false        |
+| subject       | team     | team_confidence | team_probabilities                       | refund | refund_confidence | refund_probabilities |
+|---------------|----------|----------------:|------------------------------------------|--------|------------------:|----------------------|
+| Broken mug    | shipping | 0.78            | {billing=0.15, shipping=0.78, tech=0.07} | true   | 1.00              | {yes=1.00, no=0.00}  |
+| Double charge | billing  | 0.73            | {billing=0.73, shipping=0.16, tech=0.11} | true   | 0.87              | {yes=0.87, no=0.13}  |
+| Login loop    | tech     | 0.99            | {billing=0.00, shipping=0.00, tech=0.99} | false  | 0.98              | {yes=0.02, no=0.98}  |
 
-(The confidences are rounded here. Output from the build in this repository, Apple M4 Pro.)
+(The `message` column is left out and the numbers are rounded here. Output from the build in this repository,
+Apple M4 Pro.)
 
 ## Install
 
@@ -65,7 +66,6 @@ DECIDE (
   | ASK question AS name
   [, ...]
     GIVEN expr [AS name] [, ...]
-    [ REVIEW BELOW threshold ]
 ) [alias]
 ```
 
@@ -75,14 +75,30 @@ DECIDE (
 | `ASK question AS name` | A yes/no question. |
 | `AS name` | Names the answer columns. Required. |
 | `GIVEN` | What the model reads: the *state*. With one expression, the state is its text. With several, it is `name: value \| name: value`, the same as a decision-tune recipe that reads several columns. Required. |
-| `REVIEW BELOW` | The confidence below which `needs_review` is set. The default is 0.6, the recipe default. |
 
-For each question, the clause adds these columns:
-- `CHOOSE`: `name` (the key of the chosen option) and `name_confidence` (its probability).
-- `ASK`: `name` (`p_yes >= 0.5`), `name_confidence` (`greatest(p_yes, 1 - p_yes)`) and `name_p_yes`.
+For each question, the clause adds three columns:
 
-Then it adds `needs_review`. This is true when any confidence is below the threshold, or when an answer is
-`NULL` because its input was `NULL`.
+| Column | `CHOOSE` | `ASK` |
+|---|---|---|
+| `name` | The key of the most likely option (`VARCHAR`) | `true` when P(yes) ≥ 0.5 (`BOOLEAN`) |
+| `name_confidence` | The probability of that option | `greatest(p_yes, 1 - p_yes)` |
+| `name_probabilities` | Every option's probability, `MAP(VARCHAR, DOUBLE)` | `{'yes': p_yes, 'no': 1 - p_yes}` |
+
+A `NULL` input gives `NULL` answers. The probabilities are what you threshold on, with an ordinary `WHERE`:
+
+```sql
+WITH triage AS (
+    FROM tickets DECIDE (
+        CHOOSE 'Which team should handle this customer message?' AMONG (
+            billing 'Billing: charges, refunds, invoices',
+            tech    'Tech support: bugs, crashes, login problems') AS team,
+        ASK 'Is the customer asking for a refund?' AS refund
+        GIVEN subject, message)
+)
+FROM triage
+WHERE team_confidence < 0.6                     -- unsure routing: send to a person
+   OR refund_probabilities['yes'] BETWEEN 0.2 AND 0.8;
+```
 
 DuckDB rewrites the clause into plain SQL around the functions below. So the clause works in CTEs, subqueries,
 joins, prepared statements (`ASK $1`), views and table macros. A stored view keeps the rewritten SQL.
@@ -141,9 +157,9 @@ gives these tips:
 - **Write down the criteria.** "Is this urgent?" alone gives weak results. Say what urgent means.
 - **Ask one judgment per question.** Combine the answers in SQL.
 - **Put only what a person would read into `GIVEN`.** Leave out ids and timestamps.
-- **Phrase yes/no questions so that yes is the case you act on.** Then use `p_yes` with a threshold.
+- **Phrase yes/no questions so that yes is the case you act on.** Then threshold `name_probabilities['yes']`.
 
-The model's probabilities are not calibrated. Use `needs_review` (or a threshold of your own) to send unsure rows
+The model's probabilities are not calibrated. Pick thresholds on your own labeled rows, and send the unsure rows
 to a person.
 
 ## Performance

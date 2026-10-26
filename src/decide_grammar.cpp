@@ -12,7 +12,6 @@
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
-#include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
@@ -37,18 +36,16 @@ static const char *const DECIDE_RULES[] = {
     "DecideTableRef <- DecideSource DecideKeyword? Parens(DecideBody) TableAlias?",
     "DecideSource <- ValuesRef / TableFunction / TableSubquery / BaseTableRef / ParensTableRef",
     "DecideKeyword <- 'DECIDE'",
-    "DecideBody <- List(DecideQuestion) DecideClauseOption*",
+    "DecideBody <- List(DecideQuestion) DecideGiven?",
     "DecideQuestion <- (DecideChoose / DecideAsk) DecideQuestionAlias?",
     "DecideQuestionAlias <- 'AS' ColLabelOrString",
     "DecideChoose <- 'CHOOSE' Expression DecideAmong",
     "DecideAsk <- 'ASK' Expression",
     "DecideAmong <- 'AMONG' Parens(List(DecideOption))",
     "DecideOption <- ColIdOrString Expression?",
-    "DecideClauseOption <- DecideGiven / DecideReview",
     "DecideGiven <- 'GIVEN' List(DecideInput)",
     "DecideInput <- Expression DecideInputAlias?",
     "DecideInputAlias <- 'AS' ColLabelOrString",
-    "DecideReview <- 'REVIEW' 'BELOW' Expression",
     // decision_choose(question AMONG (...) GIVEN ...) and decision_yes_no(question GIVEN ...): the functions,
     // spelled like the clause
     "DecideChooseCall <- 'DECISION_CHOOSE' Parens(DecideChooseCallBody)",
@@ -58,8 +55,6 @@ static const char *const DECIDE_RULES[] = {
 };
 
 static constexpr const char *DECISION_COLUMN_PREFIX = "__decision_";
-static constexpr const char *NEEDS_REVIEW_COLUMN = "needs_review";
-static constexpr const char *DEFAULT_REVIEW_BELOW = "0.6";
 
 //===--------------------------------------------------------------------===//
 // Parse result helpers
@@ -103,33 +98,6 @@ static ParseResult &SelectedChoice(ParseResult &parse_result) {
 	}
 }
 
-//! The children of a `Rule*` parse result (a bare Repeat, or one wrapped in a List or an Optional).
-static vector<reference<ParseResult>> RepeatChildren(ParseResult &parse_result) {
-	optional_ptr<ParseResult> current = &parse_result;
-	if (current->type == ParseResultType::OPTIONAL) {
-		auto &opt = current->Cast<OptionalParseResult>();
-		if (!opt.HasResult()) {
-			return {};
-		}
-		current = &opt.GetResult();
-	}
-	if (current->type == ParseResultType::LIST) {
-		auto &list = current->Cast<ListParseResult>();
-		if (list.GetChildren().size() == 1 && list.GetChild(0).type == ParseResultType::REPEAT) {
-			current = &list.GetChild(0);
-		}
-	}
-	vector<reference<ParseResult>> result;
-	if (current->type == ParseResultType::REPEAT) {
-		for (auto &child : current->Cast<RepeatParseResult>().GetChildren()) {
-			result.push_back(child);
-		}
-	} else {
-		result.push_back(*current);
-	}
-	return result;
-}
-
 static unique_ptr<ParsedExpression> TransformExpression(PEGTransformer &transformer, ParseResult &parse_result) {
 	return transformer.Transform<unique_ptr<ParsedExpression>>(parse_result);
 }
@@ -166,7 +134,6 @@ struct DecideInputSpec {
 struct DecideSpec {
 	vector<DecideQuestionSpec> questions;
 	vector<DecideInputSpec> inputs;
-	unique_ptr<ParsedExpression> review_below;
 };
 
 // DecideAmong <- 'AMONG' Parens(List(DecideOption))
@@ -246,18 +213,14 @@ static DecideQuestionSpec TransformQuestion(PEGTransformer &transformer, ParseRe
 	return spec;
 }
 
-// DecideBody <- List(DecideQuestion) DecideClauseOption*
+// DecideBody <- List(DecideQuestion) DecideGiven?
 static DecideSpec TransformDecideBody(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list_pr = parse_result.Cast<ListParseResult>();
 	DecideSpec spec;
-	unordered_set<string> columns {NEEDS_REVIEW_COLUMN};
+	unordered_set<string> columns;
 	for (auto &entry : ListEntries(list_pr.GetChild(0))) {
 		auto question = TransformQuestion(transformer, entry.get());
-		vector<string> outputs {question.name, question.name + "_confidence"};
-		if (question.yes_no) {
-			outputs.push_back(question.name + "_p_yes");
-		}
-		for (auto &output : outputs) {
+		for (auto &output : {question.name, question.name + "_confidence", question.name + "_probabilities"}) {
 			if (!columns.insert(StringUtil::Lower(output)).second) {
 				throw ParserException("DECIDE: question '%s' would add a second column named '%s'", question.name,
 				                      output);
@@ -265,26 +228,12 @@ static DecideSpec TransformDecideBody(PEGTransformer &transformer, ParseResult &
 		}
 		spec.questions.push_back(std::move(question));
 	}
-	for (auto &option_ref : RepeatChildren(list_pr.GetChild(1))) {
-		auto &option = SelectedChoice(option_ref.get());
-		auto &name = option.Name();
-		if (StringUtil::CIEquals(name, "DecideGiven")) {
-			if (!spec.inputs.empty()) {
-				throw ParserException("DECIDE: GIVEN is given more than once");
-			}
-			spec.inputs = TransformGiven(transformer, option);
-		} else if (StringUtil::CIEquals(name, "DecideReview")) {
-			if (spec.review_below) {
-				throw ParserException("DECIDE: REVIEW BELOW is given more than once");
-			}
-			spec.review_below = TransformExpression(transformer, option.Cast<ListParseResult>().GetChild(2));
-		} else {
-			throw InternalException("decision_tune: unexpected DECIDE option rule '%s'", name);
-		}
-	}
-	if (spec.inputs.empty()) {
+	// GIVEN is optional in the grammar only to give a clearer error than a syntax error.
+	auto given = OptionalChild(list_pr, 1);
+	if (!given) {
 		throw ParserException("DECIDE requires GIVEN, the columns the model reads (e.g. GIVEN subject, message)");
 	}
+	spec.inputs = TransformGiven(transformer, *given);
 	return spec;
 }
 
@@ -351,10 +300,11 @@ static unique_ptr<SelectStatement> MakeStatement(unique_ptr<QueryNode> node) {
 }
 
 //! FROM <source> DECIDE (CHOOSE ... AS team, ASK ... AS refund GIVEN ...) becomes
-//! SELECT * EXCLUDE (__decision_0, ...),
+//! SELECT * EXCLUDE (__decision_0, __decision_1),
 //!        __decision_0.choice AS team, __decision_0.confidence AS team_confidence,
+//!        __decision_0.probabilities AS team_probabilities,
 //!        __decision_1 >= 0.5 AS refund, greatest(__decision_1, 1 - __decision_1) AS refund_confidence,
-//!        __decision_1 AS refund_p_yes, ..., <any confidence below REVIEW BELOW or NULL> AS needs_review
+//!        map(['yes', 'no'], [__decision_1, 1 - __decision_1]) AS refund_probabilities
 //! FROM (SELECT *, decision_choose(<state>, ...) AS __decision_0, decision_yes_no(<state>, ...) AS __decision_1
 //!       FROM <source>)
 static unique_ptr<SelectNode> LowerDecide(const DecideSpec &spec, unique_ptr<TableRef> source) {
@@ -362,10 +312,8 @@ static unique_ptr<SelectNode> LowerDecide(const DecideSpec &spec, unique_ptr<Tab
 	inner->select_list.push_back(make_uniq<StarExpression>());
 	auto outer = make_uniq<SelectNode>();
 	auto star = make_uniq<StarExpression>();
-	vector<unique_ptr<ParsedExpression>> below_review;
-	auto review_below =
-	    spec.review_below ? spec.review_below->Copy() : ConstantExpression::Number(DEFAULT_REVIEW_BELOW);
 	vector<unique_ptr<ParsedExpression>> outputs;
+	auto probabilities_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::DOUBLE);
 	for (idx_t i = 0; i < spec.questions.size(); i++) {
 		auto &question = spec.questions[i];
 		auto decision = DECISION_COLUMN_PREFIX + to_string(i);
@@ -375,28 +323,33 @@ static unique_ptr<SelectNode> LowerDecide(const DecideSpec &spec, unique_ptr<Tab
 		              decision));
 		star->ExcludeListMutable().insert(QualifiedColumnName(Identifier(decision)));
 
-		unique_ptr<ParsedExpression> confidence;
 		if (question.yes_no) {
+			auto p_no = [&]() {
+				return Function("-", ConstantExpression::Integer(1), Column(decision));
+			};
 			outputs.push_back(
 			    WithAlias(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_GREATERTHANOREQUALTO,
 			                                              Column(decision), ConstantExpression::Number("0.5")),
 			              question.name));
-			confidence =
-			    Function("greatest", Column(decision), Function("-", ConstantExpression::Integer(1), Column(decision)));
-			outputs.push_back(WithAlias(confidence->Copy(), question.name + "_confidence"));
-			outputs.push_back(WithAlias(Column(decision), question.name + "_p_yes"));
+			outputs.push_back(WithAlias(Function("greatest", Column(decision), p_no()), question.name + "_confidence"));
+			// NULL, not {yes: NULL, no: NULL}, when there is no answer
+			auto probabilities = Function(
+			    "map", Function("list_value", ConstantExpression::String("yes"), ConstantExpression::String("no")),
+			    Function("list_value", Column(decision), p_no()));
+			outputs.push_back(WithAlias(
+			    Function("if", make_uniq<OperatorExpression>(ExpressionType::OPERATOR_IS_NULL, Column(decision)),
+			             make_uniq<CastExpression>(probabilities_type, ConstantExpression::Null()),
+			             std::move(probabilities)),
+			    question.name + "_probabilities"));
 		} else {
 			outputs.push_back(WithAlias(
 			    Function("struct_extract", Column(decision), ConstantExpression::String("choice")), question.name));
-			confidence = Function("struct_extract", Column(decision), ConstantExpression::String("confidence"));
-			outputs.push_back(WithAlias(confidence->Copy(), question.name + "_confidence"));
+			for (auto field : {"confidence", "probabilities"}) {
+				outputs.push_back(
+				    WithAlias(Function("struct_extract", Column(decision), ConstantExpression::String(field)),
+				              question.name + "_" + field));
+			}
 		}
-		// A missing answer (NULL input) needs a review too.
-		vector<unique_ptr<ParsedExpression>> coalesce;
-		coalesce.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_LESSTHAN, std::move(confidence),
-		                                                   review_below->Copy()));
-		coalesce.push_back(ConstantExpression::Boolean(true));
-		below_review.push_back(make_uniq<OperatorExpression>(ExpressionType::OPERATOR_COALESCE, std::move(coalesce)));
 	}
 	inner->from_table = std::move(source);
 
@@ -404,12 +357,6 @@ static unique_ptr<SelectNode> LowerDecide(const DecideSpec &spec, unique_ptr<Tab
 	for (auto &output : outputs) {
 		outer->select_list.push_back(std::move(output));
 	}
-	unique_ptr<ParsedExpression> needs_review = std::move(below_review[0]);
-	for (idx_t i = 1; i < below_review.size(); i++) {
-		needs_review = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_OR, std::move(needs_review),
-		                                                std::move(below_review[i]));
-	}
-	outer->select_list.push_back(WithAlias(std::move(needs_review), NEEDS_REVIEW_COLUMN));
 	outer->from_table = make_uniq<SubqueryRef>(MakeStatement(std::move(inner)));
 	return outer;
 }

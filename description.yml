@@ -23,7 +23,7 @@ docs:
         ('Double charge', 'I was charged twice this month.')
     ) t(subject, message);
 
-    -- Route every ticket and flag refund requests: one answer, confidence and review flag per row.
+    -- Route every ticket and flag refund requests: an answer, its confidence and all probabilities per question.
     FROM tickets DECIDE (
         CHOOSE 'Which team should handle this customer message?' AMONG (
             billing  'Billing: charges, refunds, invoices',
@@ -45,8 +45,8 @@ docs:
     and no GPU: the network runs on CPU through a statically linked ONNX Runtime.
 
     - `FROM t DECIDE (CHOOSE question AMONG (key 'description', ...) AS name, ASK question AS name, ... GIVEN
-      columns [REVIEW BELOW x])` adds an answer column `name` and a `name_confidence` column per question,
-      `name_p_yes` for yes/no questions and `needs_review`, like a decision-tune recipe.
+      columns)` adds `name`, `name_confidence` and `name_probabilities` (a MAP of option to probability) per
+      question; filter on them with an ordinary WHERE.
     - `decision_choose(state, question, options)` returns the choice, its confidence and every option's
       probability; options are a list of texts, or a MAP or STRUCT of key to description.
       `decision_yes_no(state, question)` returns P(yes). Both also take the clause's words:
