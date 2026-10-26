@@ -28,9 +28,6 @@ FROM tickets DECIDE (
 | Double charge | billing  | 0.73            | {billing=0.73, shipping=0.16, tech=0.11} | true   | 0.87              | {yes=0.87, no=0.13}  |
 | Login loop    | tech     | 0.99            | {billing=0.00, shipping=0.00, tech=0.99} | false  | 0.98              | {yes=0.02, no=0.98}  |
 
-(The `message` column is left out and the numbers are rounded here. Output from the build in this repository,
-Apple M4 Pro.)
-
 ## Install
 
 `decision_tune` is meant for DuckDB 2.0. Build it from source (see [Building](#building)), then load
