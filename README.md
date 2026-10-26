@@ -6,6 +6,11 @@ model ([model card](https://huggingface.co/decision-tune/decisiontune-1.0),
 option and gives a probability for each, or it gives P(yes) for a yes/no question. It does one encoder pass and
 never generates text.
 
+Decision models of this kind are also offered as hosted APIs, such as TypeSafe's [Jev](https://typesafe.ai) and
+OpenAI's [Decisions API](https://developers.openai.com/api/docs/guides/decisions). DecisionTune is an open-weights
+model that runs on your own machine. [Compared with hosted decision APIs](#compared-with-hosted-decision-apis)
+explains the trade-offs.
+
 With this extension, routing, tagging and triage are SQL queries. They need no Python, no API key and no GPU. The
 network runs on CPU through a statically linked [ONNX Runtime](https://onnxruntime.ai/).
 
@@ -182,6 +187,46 @@ model, and neither does a column that you do not select.
 
 The extension keeps the probabilities of the last 100,000 distinct prompts in memory. A query that asks the same
 question about the same state twice is scored once, and so is a query that you run again.
+
+### Compared with hosted decision APIs
+
+TypeSafe's Jev and OpenAI's Decisions API answer the same kind of question (pick an option, or give P(yes)) over
+HTTP. The figures below are as published in October 2026. Only the DecisionTune throughput was measured here.
+
+| | `decision_tune` (DecisionTune 1.0) | [Jev](https://openrouter.ai/docs/guides/community/jev) (TypeSafe) | [Decisions API](https://developers.openai.com/api/docs/guides/decisions) (OpenAI) |
+|---|---|---|---|
+| Runs | In DuckDB, on your CPU | Hosted API | Hosted API (`gpt-6-luna`) |
+| Weights | Open, Apache-2.0, 395M parameters | Closed | Closed |
+| Price | No per-call cost | $0.042 per million input tokens, output free[^typesafe] | $0.10 per million input tokens, output free[^openai] |
+| Speed | About 60 ms per decision on one core; 17 to 79 decisions per second on an Apple M4 Pro (above) | 0.114 s for an example workflow[^typesafe] | 100 to 180 ms per response[^techcrunch] |
+| Decision Index 0.2.1 | 29.57[^card] | 57.89[^kit] | Not published |
+| Context | 8,192 tokens | 262,144 tokens[^openrouter] | Not published |
+| Your data | Stays on your machine | Sent to TypeSafe | Sent to OpenAI |
+
+The [Decision Index](https://github.com/apolinario/decision-index) is chance-corrected: 0 is random guessing and
+100 is perfect. On version 0.2.1, Jev scores about twice what DecisionTune 1.0 does. OpenAI has published no Decision
+Index score; TechCrunch reports that it ranks 14th on Artificial Analysis's Decision Index, where the latest Jev
+ranks 3rd.[^techcrunch]
+
+So the hosted models are more accurate, and at these prices 10,000 rows cost cents. Use this extension when the data
+must not leave the machine, when the queries must work offline, when the result must be reproducible with a pinned
+model, or when you want the decisions inside a SQL query without managing API keys, rate limits and retries. Check
+the accuracy on a sample of your own labeled rows either way.
+
+The speed figures do not compare like with like: the hosted figures include the network round trip and come from
+the vendors, and a hosted API can answer many rows at once without your CPU or memory bandwidth.
+
+[^typesafe]: [typesafe.ai](https://typesafe.ai): "$42 per billion input tokens"; example workflow completed in
+    0.114 s.
+[^openai]: [OpenAI Decisions guide](https://developers.openai.com/api/docs/guides/decisions): `POST /v1/decisions`,
+    up to 400 questions per request about one shared input.
+[^techcrunch]: [TechCrunch, 22 October 2026](https://techcrunch.com/2026/10/22/openai-makes-its-jev-competitor-widely-available-as-decision-model-competition-heats-up/).
+[^card]: [DecisionTune 1.0 model card](https://huggingface.co/decision-tune/decisiontune-1.0): one complete run
+    (raw 46.80); a second seed scored 29.13.
+[^kit]: [Decision Index reproduction kit](https://github.com/apolinario/decision-index), reference score in its
+    0.2.1 parity test.
+[^openrouter]: [OpenRouter Jev guide](https://openrouter.ai/docs/guides/community/jev). Requests over about 32,000
+    bytes use a slower, less accurate long-context mode.
 
 ## Settings
 
